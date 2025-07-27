@@ -36,7 +36,7 @@ app.use(
     cookie: {
       httpOnly: true,
       secure: false, // change to true if using https
-      sameSite: "lax",
+      sameSite: "strict",
       maxAge: 1000 * 60 * 60, // 1 hour
     },
   })
@@ -66,6 +66,10 @@ app.post("/logout", (req, res) => {
     res.clearCookie("connect.sid");
     res.json({ message: "Logged out" });
   });
+});
+
+app.post("/say-hello", (req, res) => {
+  res.json(`Hello`);
 });
 
 const PORT = process.env.PORT || 4000;
