@@ -65,7 +65,7 @@ function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>React + Redis Sessions</h1>
+        <h1>React + Redis Sessions + JWT</h1>
 
         {user ? (
           // Logged in view
