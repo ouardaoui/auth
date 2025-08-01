@@ -2,16 +2,14 @@ const express = require("express");
 const jwt = require("jsonwebtoken");
 const cors = require("cors");
 const crypto = require("crypto");
-const cookieParser = require("cookie-parser");
 require("dotenv").config();
 
 const app = express();
 
 // Middleware
 app.use(express.json());
-app.use(cookieParser());
 
-// ✅ Allow React frontend to send cookies
+// ✅ Allow React frontend to send requests
 app.use(
   cors({
     origin: [
@@ -25,14 +23,13 @@ app.use(
 // JWT Configuration
 const JWT_SECRET = process.env.JWT_SECRET || "your-super-secret-jwt-key";
 const JWT_EXPIRES_IN = "1h";
-const CSRF_TOKEN_LENGTH = 32;
 
-// In-memory storage for CSRF tokens (use Redis in production)
+// In-memory storage for CSRF tokens (you can use Redis if preferred)
 const csrfTokenStore = new Map();
 
 // 🔒 Generate CSRF Token
 const generateCSRFToken = () => {
-  return crypto.randomBytes(CSRF_TOKEN_LENGTH).toString("hex");
+  return crypto.randomBytes(32).toString("hex");
 };
 
 // 🔒 Generate JWT Token
@@ -50,7 +47,9 @@ const generateJWT = (userId, username) => {
 
 // 🔒 Verify JWT Middleware
 const verifyJWT = (req, res, next) => {
-  const token = req.cookies.jwt;
+  // Get token from Authorization header
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.split(" ")[1]; // Bearer TOKEN
 
   if (!token) {
     return res.status(401).json({ error: "No token provided" });
@@ -70,24 +69,22 @@ const verifyJWT = (req, res, next) => {
 
 // 🔒 CSRF Protection Middleware
 const csrfProtection = (req, res, next) => {
-  // Skip CSRF protection for GET requests and specific endpoints
-  if (
-    req.method === "GET" ||
-    req.path === "/csrf-token" ||
-    req.path === "/login"
-  ) {
+  // Skip CSRF protection for GET requests and auth endpoints
+  if (req.method === "GET" || ["/login", "/csrf-token"].includes(req.path)) {
     return next();
   }
 
-  // Check if user is authenticated
-  const token = req.cookies.jwt;
+  // Get JWT from header
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.split(" ")[1];
+
   if (!token) {
     return res.status(401).json({ error: "Not authenticated" });
   }
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    const csrfToken = req.headers["x-csrf-token"] || req.body._csrf;
+    const csrfToken = req.headers["x-csrf-token"];
     const storedToken = csrfTokenStore.get(decoded.userId);
 
     if (!csrfToken || !storedToken || csrfToken !== storedToken) {
@@ -103,19 +100,6 @@ const csrfProtection = (req, res, next) => {
     return res.status(401).json({ error: "Invalid authentication" });
   }
 };
-
-// 🔑 Endpoint to get CSRF token (requires authentication)
-app.get("/csrf-token", verifyJWT, (req, res) => {
-  const userId = req.user.userId;
-  let csrfToken = csrfTokenStore.get(userId);
-
-  if (!csrfToken) {
-    csrfToken = generateCSRFToken();
-    csrfTokenStore.set(userId, csrfToken);
-  }
-
-  res.json({ csrfToken });
-});
 
 // 🔑 Login endpoint
 app.post("/login", async (req, res) => {
@@ -136,41 +120,38 @@ app.post("/login", async (req, res) => {
   const csrfToken = generateCSRFToken();
   csrfTokenStore.set(userId, csrfToken);
 
-  // Set JWT in httpOnly cookie
-  res.cookie("jwt", jwtToken, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
-    maxAge: 60 * 60 * 1000, // 1 hour
-  });
-
+  // Return tokens in response body (not as cookies)
   res.json({
     message: "Logged in",
     username,
-    csrfToken,
+    token: jwtToken, // JWT to be stored in localStorage
+    csrfToken, // CSRF token
+    expiresIn: 3600, // 1 hour in seconds
   });
 });
 
+// 🔑 Get CSRF token (requires authentication)
+app.get("/csrf-token", verifyJWT, (req, res) => {
+  const userId = req.user.userId;
+  let csrfToken = csrfTokenStore.get(userId);
+
+  if (!csrfToken) {
+    csrfToken = generateCSRFToken();
+    csrfTokenStore.set(userId, csrfToken);
+  }
+
+  res.json({ csrfToken });
+});
+
 // 🔑 Check authentication status
-app.get("/me", (req, res) => {
-  const token = req.cookies.jwt;
+app.get("/me", verifyJWT, (req, res) => {
+  const csrfToken = csrfTokenStore.get(req.user.userId);
 
-  if (!token) {
-    return res.json({ loggedIn: false });
-  }
-
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const csrfToken = csrfTokenStore.get(decoded.userId);
-
-    res.json({
-      loggedIn: true,
-      username: decoded.username,
-      csrfToken: csrfToken || null,
-    });
-  } catch (error) {
-    res.json({ loggedIn: false });
-  }
+  res.json({
+    loggedIn: true,
+    username: req.user.username,
+    csrfToken: csrfToken || null,
+  });
 });
 
 // 🔑 Logout endpoint
@@ -180,8 +161,7 @@ app.post("/logout", csrfProtection, (req, res) => {
     csrfTokenStore.delete(req.user.userId);
   }
 
-  // Clear JWT cookie
-  res.clearCookie("jwt");
+  // Client should remove JWT from localStorage
   res.json({ message: "Logged out" });
 });
 
@@ -194,8 +174,8 @@ app.post("/refresh-csrf", verifyJWT, (req, res) => {
   res.json({ csrfToken: newCsrfToken });
 });
 
-// 🔄 Refresh JWT token (optional endpoint)
-app.post("/refresh-token", verifyJWT, csrfProtection, (req, res) => {
+// 🔄 Refresh JWT token
+app.post("/refresh-token", csrfProtection, (req, res) => {
   const { userId, username } = req.user;
 
   // Generate new JWT
@@ -205,26 +185,26 @@ app.post("/refresh-token", verifyJWT, csrfProtection, (req, res) => {
   const newCsrfToken = generateCSRFToken();
   csrfTokenStore.set(userId, newCsrfToken);
 
-  // Set new JWT in cookie
-  res.cookie("jwt", newJwtToken, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
-    maxAge: 60 * 60 * 1000, // 1 hour
-  });
-
   res.json({
     message: "Token refreshed",
+    token: newJwtToken,
     csrfToken: newCsrfToken,
+    expiresIn: 3600,
   });
 });
 
 // Example protected route
-app.post("/api/protected", csrfProtection, (req, res) => {
+app.post("/api/protected", verifyJWT, csrfProtection, (req, res) => {
   res.json({
     message: "This is a protected route",
     user: req.user.username,
+    data: req.body,
   });
+});
+
+// Health check
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
 // Error handling middleware

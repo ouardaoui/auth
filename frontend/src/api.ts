@@ -1,76 +1,77 @@
-import axios, { AxiosResponse } from "axios";
-import { LoginResponse, MeResponse, LogoutResponse } from "./types";
+import axios, { AxiosResponse, AxiosError } from "axios";
+import {
+  LoginResponse,
+  MeResponse,
+  LogoutResponse,
+  TokenResponse,
+} from "./types";
 
-// Configure axios to include cookies
-axios.defaults.withCredentials = true;
-
+// API Configuration
 const API_BASE_URL = process.env.REACT_APP_API_URL || "http://localhost:4000";
 
 const api = axios.create({
   baseURL: API_BASE_URL,
-  withCredentials: true,
 });
 
-// Store CSRF token globally
-let csrfToken: string | null = null;
-let csrfTokenPromise: Promise<string> | null = null;
+// Token Management
+const TOKEN_KEY = "jwt_token";
+const CSRF_KEY = "csrf_token";
+const TOKEN_EXPIRY_KEY = "token_expiry";
 
-// Extended interfaces to include CSRF token
-interface LoginResponseWithToken extends LoginResponse {
-  csrfToken?: string;
-}
-
-interface MeResponseWithToken extends MeResponse {
-  csrfToken?: string;
-}
-
-// Function to get CSRF token
-const getCsrfToken = async (): Promise<string> => {
-  try {
-    const response: AxiosResponse<{ csrfToken: string }> = await api.get(
-      "/csrf-token"
-    );
-    csrfToken = response.data.csrfToken;
-    csrfTokenPromise = null;
-    return csrfToken;
-  } catch (error) {
-    csrfTokenPromise = null;
-    console.error("Failed to get CSRF token:", error);
-    throw error;
-  }
+// Helper functions for token management
+const saveTokens = (token: string, csrfToken: string, expiresIn: number) => {
+  localStorage.setItem(TOKEN_KEY, token);
+  localStorage.setItem(CSRF_KEY, csrfToken);
+  const expiryTime = new Date().getTime() + expiresIn * 1000;
+  localStorage.setItem(TOKEN_EXPIRY_KEY, expiryTime.toString());
 };
 
-// Ensure CSRF token is available
-const ensureCSRFToken = async (): Promise<string> => {
-  if (csrfToken) return csrfToken;
+const getToken = (): string | null => {
+  const token = localStorage.getItem(TOKEN_KEY);
+  const expiry = localStorage.getItem(TOKEN_EXPIRY_KEY);
 
-  if (!csrfTokenPromise) {
-    csrfTokenPromise = getCsrfToken();
+  if (!token || !expiry) return null;
+
+  // Check if token is expired
+  if (new Date().getTime() > parseInt(expiry)) {
+    clearTokens();
+    return null;
   }
 
-  return csrfTokenPromise;
+  return token;
 };
 
-// Intercept requests to add CSRF token
+const getCsrfToken = (): string | null => {
+  return localStorage.getItem(CSRF_KEY);
+};
+
+const clearTokens = () => {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(CSRF_KEY);
+  localStorage.removeItem(TOKEN_EXPIRY_KEY);
+};
+
+// Axios Request Interceptor - Add JWT and CSRF tokens to requests
 api.interceptors.request.use(
-  async (config) => {
-    // Add CSRF token to POST, PUT, PATCH, DELETE requests
+  (config) => {
+    // Add JWT token to Authorization header
+    const token = getToken();
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+
+    // Add CSRF token for mutating requests
     if (
       ["post", "put", "patch", "delete"].includes(
         config.method?.toLowerCase() || ""
       )
     ) {
-      // Skip CSRF for login endpoint
-      if (config.url !== "/login") {
-        try {
-          const token = await ensureCSRFToken();
-          config.headers["X-CSRF-Token"] = token;
-        } catch (error) {
-          // If we can't get a CSRF token, let the request proceed
-          // It will likely fail with 403, which we handle in response interceptor
-        }
+      const csrfToken = getCsrfToken();
+      if (csrfToken && config.url !== "/login") {
+        config.headers["X-CSRF-Token"] = csrfToken;
       }
     }
+
     return config;
   },
   (error) => {
@@ -78,56 +79,48 @@ api.interceptors.request.use(
   }
 );
 
-// Intercept responses to handle CSRF errors and update tokens
+// Axios Response Interceptor - Handle token expiration and CSRF errors
 api.interceptors.response.use(
   (response) => {
-    // Update CSRF token if included in response
-    if (response.data?.csrfToken) {
-      csrfToken = response.data.csrfToken;
-    }
     return response;
   },
-  async (error) => {
-    const originalRequest = error.config;
+  async (error: AxiosError) => {
+    const originalRequest: any = error.config;
 
     // Handle token expiration
-    if (
-      error.response?.status === 401 &&
-      error.response?.data?.error === "Token expired" &&
-      !originalRequest._retry
-    ) {
+    if (error.response?.status === 401 && !originalRequest._retry) {
       originalRequest._retry = true;
 
-      // Try to refresh the token
-      try {
-        await authAPI.refreshToken();
-        return api.request(originalRequest);
-      } catch (refreshError) {
-        // Refresh failed, user needs to login again
-        csrfToken = null;
-        window.location.href = "/login"; // Or handle via your app's routing
-        return Promise.reject(error);
+      // If it's a token expired error, try to refresh
+      if ((error.response.data as any)?.error === "Token expired") {
+        try {
+          const response = await authAPI.refreshToken();
+          return api.request(originalRequest);
+        } catch (refreshError) {
+          // Refresh failed, clear tokens and redirect to login
+          clearTokens();
+          window.location.href = "/login";
+          return Promise.reject(error);
+        }
       }
+
+      // Other 401 errors - clear tokens
+      clearTokens();
     }
 
-    // Handle invalid CSRF token
+    // Handle CSRF token errors
     if (
       error.response?.status === 403 &&
-      (error.response?.data?.error === "Invalid CSRF token" ||
-        error.response?.data?.code === "EBADCSRFTOKEN") &&
+      (error.response.data as any)?.code === "EBADCSRFTOKEN" &&
       !originalRequest._retry
     ) {
       originalRequest._retry = true;
 
       try {
-        // Force refresh CSRF token
-        csrfToken = null;
-        await getCsrfToken();
-
-        // Retry the original request with new token
-        originalRequest.headers["X-CSRF-Token"] = csrfToken;
+        // Refresh CSRF token
+        const response = await authAPI.refreshCsrfToken();
         return api.request(originalRequest);
-      } catch (refreshError) {
+      } catch (csrfError) {
         return Promise.reject(error);
       }
     }
@@ -136,64 +129,87 @@ api.interceptors.response.use(
   }
 );
 
+// API Methods
 export const authAPI = {
-  // Login user (no CSRF needed for login)
+  // Login
   login: async (username: string): Promise<LoginResponse> => {
-    const response: AxiosResponse<LoginResponseWithToken> = await api.post(
-      "/login",
-      { username }
-    );
+    const response = await api.post<LoginResponse>("/login", { username });
 
-    // Store CSRF token from login response
-    if (response.data.csrfToken) {
-      csrfToken = response.data.csrfToken;
-    }
+    // Save tokens to localStorage
+    saveTokens(
+      response.data.token,
+      response.data.csrfToken,
+      response.data.expiresIn
+    );
 
     return response.data;
   },
 
   // Check authentication status
   me: async (): Promise<MeResponse> => {
-    const response: AxiosResponse<MeResponseWithToken> = await api.get("/me");
+    try {
+      const response = await api.get<MeResponse>("/me");
 
-    // Update CSRF token if provided
-    if (response.data.csrfToken) {
-      csrfToken = response.data.csrfToken;
+      // Update CSRF token if provided
+      if (response.data.csrfToken) {
+        localStorage.setItem(CSRF_KEY, response.data.csrfToken);
+      }
+
+      return response.data;
+    } catch (error) {
+      // If request fails, user is not authenticated
+      return { loggedIn: false };
     }
-
-    return response.data;
   },
 
-  // Logout user
+  // Logout
   logout: async (): Promise<LogoutResponse> => {
-    const response = await api.post("/logout");
-
-    // Clear stored CSRF token after logout
-    csrfToken = null;
-
-    return response.data;
-  },
-
-  // Refresh JWT and CSRF tokens
-  refreshToken: async (): Promise<{ message: string; csrfToken: string }> => {
-    const response = await api.post("/refresh-token");
-
-    if (response.data.csrfToken) {
-      csrfToken = response.data.csrfToken;
+    try {
+      const response = await api.post<LogoutResponse>("/logout");
+      return response.data;
+    } finally {
+      // Always clear tokens, even if request fails
+      clearTokens();
     }
+  },
+
+  // Refresh JWT token
+  refreshToken: async (): Promise<TokenResponse> => {
+    const response = await api.post<TokenResponse>("/refresh-token");
+
+    // Save new tokens
+    saveTokens(
+      response.data.token,
+      response.data.csrfToken,
+      response.data.expiresIn
+    );
 
     return response.data;
   },
 
-  // Refresh only CSRF token
+  // Refresh CSRF token only
   refreshCsrfToken: async (): Promise<string> => {
-    csrfToken = null; // Force new token
-    return getCsrfToken();
+    const response = await api.post<{ csrfToken: string }>("/refresh-csrf");
+    const newCsrfToken = response.data.csrfToken;
+
+    // Update stored CSRF token
+    localStorage.setItem(CSRF_KEY, newCsrfToken);
+
+    return newCsrfToken;
   },
 
-  // Get current CSRF token (useful for debugging)
-  getCurrentCsrfToken: (): string | null => {
-    return csrfToken;
+  // Check if user is authenticated (client-side check)
+  isAuthenticated: (): boolean => {
+    return getToken() !== null;
+  },
+
+  // Get current tokens (for debugging)
+  getCurrentTokens: () => {
+    return {
+      jwt: getToken(),
+      csrf: getCsrfToken(),
+      expiry: localStorage.getItem(TOKEN_EXPIRY_KEY),
+    };
   },
 
   // Example protected API call
